@@ -2,7 +2,10 @@
 
 - 首版(v1)为全量站点快照;此后每版只列新增、改值(upsert)和删除(delete)。
 - 每版分页发布,响应携带连续版号 version、页号 page、总页数 total_pages。
-- 管理接口支持:发布新修订(可切换修订)、重置、注入缺页/超时/同版同站冲突故障。
+- 代际(generation):每次重置或服务重启都会生成新代际,版号从 v1 重新编号;
+  所有数据接口响应都携带 generation,采集方据此区分同名版号属于哪一代。
+- 管理接口支持:发布新修订(可切换修订)、重置、注入缺页/超时/同版同站冲突/
+  分页期间重置(代际切换)故障。
 """
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ import os
 import random
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal, Optional
@@ -26,12 +30,13 @@ LOCK = threading.Lock()
 
 # ---------------- 内部状态(仅源站可见的"真实值"与已发布修订) ----------------
 STATE = {
+    "generation": None,  # 当前代际标识;重置/重启时更换
     "seed": DEFAULT_SEED,
     "rng": random.Random(DEFAULT_SEED),
     "truth": {},      # station_id -> pm25,当前最新全量
     "versions": {},   # version -> {version, items, pages, total_pages, created_at}
     "current": 0,
-    "faults": [],     # [{version, page, kind, times}], times=-1 表示一直生效
+    "faults": [],     # [{version, page, kind, times, ...}], times=-1 表示一直生效
 }
 
 
@@ -45,10 +50,12 @@ def _paginate(items: list[dict]) -> tuple[int, dict[int, list[dict]]]:
 
 
 def _reset(station_count: int, seed: int) -> None:
+    """重置:生成新代际,版号从 v1 重新编号(首版为全量快照)。"""
     rng = random.Random(seed)
     truth = {f"S{i:02d}": round(rng.uniform(5, 150), 1) for i in range(1, station_count + 1)}
     items = [{"station_id": sid, "op": "upsert", "pm25": pm} for sid, pm in sorted(truth.items())]
     total, pages = _paginate(items)
+    STATE["generation"] = uuid.uuid4().hex
     STATE["seed"] = seed
     STATE["rng"] = rng
     STATE["truth"] = truth
@@ -87,14 +94,14 @@ def _apply_ops(ops: list[dict]) -> None:
             truth.pop(it["station_id"], None)
 
 
-def _consume_fault(version: int, page: int) -> Optional[str]:
+def _consume_fault(version: int, page: int) -> Optional[dict]:
     for f in list(STATE["faults"]):
         if f["version"] == version and f["page"] == page and f["times"] != 0:
             if f["times"] > 0:
                 f["times"] -= 1
                 if f["times"] == 0:
                     STATE["faults"].remove(f)
-            return f["kind"]
+            return f
     return None
 
 
@@ -117,8 +124,12 @@ class ResetRequest(BaseModel):
 class Fault(BaseModel):
     version: int
     page: int = Field(default=1, ge=1)
-    kind: Literal["missing", "timeout", "conflict"]
+    kind: Literal["missing", "timeout", "conflict", "reset"]
     times: int = 1  # 触发次数;-1 表示一直生效
+    # 仅 kind=reset 使用:重置后的站点数与种子(缺省沿用当前站点数、种子+1,
+    # 使新代际数据与旧代际可区分)
+    station_count: Optional[int] = Field(default=None, ge=1, le=500)
+    seed: Optional[int] = None
 
 
 class FaultsRequest(BaseModel):
@@ -171,13 +182,14 @@ def healthz():
 @app.get("/api/revisions/current")
 def current_revision():
     with LOCK:
-        return {"current_version": STATE["current"]}
+        return {"generation": STATE["generation"], "current_version": STATE["current"]}
 
 
 @app.get("/api/revisions")
 def list_revisions():
     with LOCK:
         return {
+            "generation": STATE["generation"],
             "current_version": STATE["current"],
             "versions": [
                 {
@@ -194,6 +206,15 @@ def list_revisions():
 @app.get("/api/revisions/{version}/pages/{page}")
 def get_page(version: int, page: int):
     with LOCK:
+        fault = _consume_fault(version, page)
+        if fault is not None and fault["kind"] == "reset":
+            # 分页期间源站重置:代际切换,版号从 v1 重新编号
+            count = fault.get("station_count") or max(1, len(STATE["truth"]))
+            seed = fault.get("seed") if fault.get("seed") is not None else STATE["seed"] + 1
+            _reset(count, seed)
+            raise HTTPException(
+                409, f"source reset during pagination; new generation {STATE['generation']}"
+            )
         ver = STATE["versions"].get(version)
         if ver is None:
             raise HTTPException(404, f"version {version} not found")
@@ -201,13 +222,14 @@ def get_page(version: int, page: int):
             raise HTTPException(404, f"page {page} of version {version} not found")
         items = [dict(i) for i in ver["pages"][page]]
         total = ver["total_pages"]
+        generation = STATE["generation"]
         first_item = dict(ver["items"][0]) if ver["items"] else None
-        fault = _consume_fault(version, page)
-    if fault == "missing":
+        kind = fault["kind"] if fault else None
+    if kind == "missing":
         raise HTTPException(404, f"page {page} of version {version} not found (injected)")
-    if fault == "timeout":
+    if kind == "timeout":
         time.sleep(FAULT_SLEEP)
-    if fault == "conflict" and first_item is not None:
+    if kind == "conflict" and first_item is not None:
         # 同版同站冲突:追加一条与本版首条同站但取值不同的记录
         items.append(
             {
@@ -216,7 +238,13 @@ def get_page(version: int, page: int):
                 "pm25": round((first_item.get("pm25") or 0) + 50.0, 1),
             }
         )
-    return {"version": version, "page": page, "total_pages": total, "items": items}
+    return {
+        "generation": generation,
+        "version": version,
+        "page": page,
+        "total_pages": total,
+        "items": items,
+    }
 
 
 # ---------------- 管理接口(切换修订 / 故障注入) ----------------
@@ -225,6 +253,7 @@ def admin_reset(req: ResetRequest = ResetRequest()):
     with LOCK:
         _reset(req.station_count, req.seed)
         return {
+            "generation": STATE["generation"],
             "current_version": STATE["current"],
             "station_count": len(STATE["truth"]),
             "seed": STATE["seed"],
@@ -246,7 +275,13 @@ def admin_publish(req: PublishRequest = PublishRequest()):
             "created_at": _now(),
         }
         STATE["current"] = version
-        return {"version": version, "total_pages": total, "item_count": len(ops), "ops": ops}
+        return {
+            "generation": STATE["generation"],
+            "version": version,
+            "total_pages": total,
+            "item_count": len(ops),
+            "ops": ops,
+        }
 
 
 @app.get("/admin/faults")
@@ -273,6 +308,7 @@ def delete_faults():
 def admin_state():
     with LOCK:
         return {
+            "generation": STATE["generation"],
             "current_version": STATE["current"],
             "station_count": len(STATE["truth"]),
             "seed": STATE["seed"],

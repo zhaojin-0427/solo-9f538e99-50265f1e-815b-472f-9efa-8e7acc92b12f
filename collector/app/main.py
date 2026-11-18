@@ -51,7 +51,7 @@ def healthz():
 
 @app.post("/collections")
 def create_collection(req: CollectRequest):
-    """采集某 UTC 小时:先固定源站当前版,再逐版补齐到该版。"""
+    """采集某 UTC 小时:先固定源站代际与目标版,再逐版补齐(新代际从首版全量重建)。"""
     hour = _check_hour(req.hour)
     try:
         return service.collect_hour(hour)
@@ -91,10 +91,12 @@ def list_versions(hour: str):
         if row is None:
             raise HTTPException(404, f"hour {hour} never collected")
         vers = db.execute(
-            "SELECT * FROM versions WHERE hour=? ORDER BY version", (hour,)
+            "SELECT * FROM versions WHERE hour=? ORDER BY confirmed_at, generation, version",
+            (hour,),
         ).fetchall()
         return {
             "hour": hour,
+            "current_generation": row["current_generation"],
             "current_version": row["current_version"],
             "versions": [dict(v) for v in vers],
         }
@@ -105,41 +107,63 @@ def list_versions(hour: str):
 @app.get("/hours/{hour}/data")
 def hour_data(
     hour: str,
-    version: Optional[int] = Query(default=None, description="缺省取当前版指针"),
+    generation: Optional[str] = Query(default=None, description="缺省取当前代际"),
+    version: Optional[int] = Query(default=None, description="缺省取当前版;"
+                                     "指定 generation 而未指定 version 时取该代际最新确认版"),
     station_id: Optional[str] = Query(default=None),
 ):
-    """查询某已确认版当时的完整数据。"""
+    """查询某代际某已确认版当时的完整数据(默认:当前代际当前版)。"""
     hour = _check_hour(hour)
     db = dbmod.connect()
     try:
         row = dbmod.get_hour(db, hour)
         if row is None:
             raise HTTPException(404, f"hour {hour} never collected")
-        v = version if version is not None else row["current_version"]
+        gen = generation if generation is not None else row["current_generation"]
+        if gen is None:
+            raise HTTPException(404, f"hour {hour} has no confirmed version yet")
+        if version is not None:
+            v = version
+        elif generation is None:
+            v = row["current_version"]
+        else:
+            # 只指定代际:取该代际最新确认版
+            latest = db.execute(
+                "SELECT MAX(version) AS v FROM versions WHERE hour=? AND generation=?",
+                (hour, gen),
+            ).fetchone()["v"]
+            if latest is None:
+                raise HTTPException(404, f"generation {gen} of hour {hour} is not confirmed")
+            v = latest
         if v == 0:
             raise HTTPException(404, f"hour {hour} has no confirmed version yet")
         vrow = db.execute(
-            "SELECT * FROM versions WHERE hour=? AND version=?", (hour, v)
+            "SELECT * FROM versions WHERE hour=? AND generation=? AND version=?",
+            (hour, gen, v),
         ).fetchone()
         if vrow is None:
-            raise HTTPException(404, f"version {v} of hour {hour} is not confirmed")
+            raise HTTPException(
+                404, f"version {v} of generation {gen} for hour {hour} is not confirmed"
+            )
         if station_id is not None:
             rows = db.execute(
-                "SELECT station_id, pm25 FROM entries WHERE hour=? AND version=? AND station_id=?",
-                (hour, v, station_id),
+                "SELECT station_id, pm25 FROM entries "
+                "WHERE hour=? AND generation=? AND version=? AND station_id=?",
+                (hour, gen, v, station_id),
             ).fetchall()
             if not rows:
                 raise HTTPException(404, f"station {station_id} not present in version {v}")
         else:
             rows = db.execute(
-                "SELECT station_id, pm25 FROM entries WHERE hour=? AND version=? "
-                "ORDER BY station_id",
-                (hour, v),
+                "SELECT station_id, pm25 FROM entries "
+                "WHERE hour=? AND generation=? AND version=? ORDER BY station_id",
+                (hour, gen, v),
             ).fetchall()
         return {
             "hour": hour,
+            "generation": gen,
             "version": v,
-            "is_current": v == row["current_version"],
+            "is_current": gen == row["current_generation"] and v == row["current_version"],
             "station_count": len(rows),
             "stations": [{"station_id": r["station_id"], "pm25": r["pm25"]} for r in rows],
         }
